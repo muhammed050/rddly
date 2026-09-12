@@ -1,0 +1,11 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {normalize,matches,selectVariant,canReply,csvCell,commissionAmount,validPublicUrl,validateAutomation} from '../lib/engine.mjs';
+test('Arabic keyword normalization',()=>{assert.equal(normalize('إِرْسَال'),'ارسال');assert.equal(matches('ممكن السِّعر؟','رابط,السعر'),true);assert.equal(matches('مرحبا','سعر'),false);});
+test('any comment when keywords are empty',()=>assert.equal(matches('hello',''),true));
+test('stable split testing',()=>assert.deepEqual(selectVariant('user1','A','B'),selectVariant('user1','A','B')));
+test('reply window is strictly under 24h',()=>{const now=Date.now();assert.equal(canReply(new Date(now-23*3600000).toISOString(),now),true);assert.equal(canReply(new Date(now-24*3600000).toISOString(),now),false);assert.equal(canReply('invalid',now),false);});
+test('CSV formula injection protected',()=>{assert.equal(csvCell('=HYPERLINK("evil")'),'"\'=HYPERLINK(""evil"")"');assert.equal(csvCell('hello'),'"hello"');});
+test('commission rounded in cents',()=>{assert.equal(commissionAmount(19.99),5);assert.throws(()=>commissionAmount(-5));});
+test('unsafe campaign URLs rejected',()=>{assert.equal(validPublicUrl('javascript:alert(1)'),false);assert.equal(validPublicUrl('https://user:pass@example.com'),false);assert.equal(validPublicUrl('https://example.com/product'),true);});
+test('automation requires a reply',()=>{assert.ok(validateAutomation({name:'test'}));assert.equal(validateAutomation({name:'test',reply:'hello'}),null);});

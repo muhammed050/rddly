@@ -1,0 +1,13 @@
+import {cookies} from 'next/headers';
+import {randomUUID} from 'node:crypto';
+import {digest,token} from './security';
+import {sql} from './db';
+export class HttpError extends Error{constructor(public status:number,message:string){super(message);}}
+export async function session(){const jar=await cookies();const t=jar.get('rddly_session')?.value;if(!t)return null;const r=await sql('SELECT u.id,u.email,u.name FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>now()',[digest(t)]);return r.rows[0]||null;}
+export async function requireUser(){const u=await session();if(!u)throw new HttpError(401,'سجّل الدخول أولًا');return u;}
+export async function workspace(write=false){const u=await requireUser();const id=(await cookies()).get('rddly_workspace')?.value;const r=await sql('SELECT w.*,m.role FROM workspaces w JOIN members m ON m.workspace_id=w.id WHERE m.user_id=$1 AND ($2::text IS NULL OR w.id::text=$2) ORDER BY w.created_at LIMIT 1',[u.id,id||null]);const w=r.rows[0];if(!w)throw new HttpError(403,'مساحة العمل غير متاحة');if(write&&!['owner','admin'].includes(w.role))throw new HttpError(403,'تحتاج صلاحية مدير');return {user:u,workspace:w};}
+export async function startSession(userId:string,workspaceId?:string){const t=token();await sql("INSERT INTO sessions VALUES($1,$2,now()+interval '30 days')",[digest(t),userId]);const jar=await cookies();const opt={httpOnly:true,secure:process.env.NODE_ENV==='production',sameSite:'lax' as const,path:'/',maxAge:30*86400};jar.set('rddly_session',t,opt);if(workspaceId)jar.set('rddly_workspace',workspaceId,opt);}
+export function sameOrigin(req:Request){const origin=req.headers.get('origin');const target=new URL(process.env.APP_URL||req.url).origin;if(!origin||origin!==target)throw new HttpError(403,'مصدر الطلب غير موثوق');}
+export async function rateLimit(key:string,max=10,seconds=900){const r=await sql('INSERT INTO rate_limits(key,count,expires_at) VALUES($1,1,now()+$2*interval \'1 second\') ON CONFLICT(key) DO UPDATE SET count=CASE WHEN rate_limits.expires_at<now() THEN 1 ELSE rate_limits.count+1 END,expires_at=CASE WHEN rate_limits.expires_at<now() THEN excluded.expires_at ELSE rate_limits.expires_at END RETURNING count',[key,seconds]);if(r.rows[0].count>max)throw new HttpError(429,'طلبات كثيرة. حاول لاحقًا.');}
+export async function audit(w:string,u:string,action:string,details:unknown={}){await sql('INSERT INTO audit(id,workspace_id,user_id,action,details) VALUES($1,$2,$3,$4,$5)',[randomUUID(),w,u,action,JSON.stringify(details)]);}
+export async function admin(){const u=await requireUser();if(!process.env.ADMIN_USER_ID||u.id!==process.env.ADMIN_USER_ID)throw new HttpError(403,'هذه الصفحة لمدير المنصة');return u;}

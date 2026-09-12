@@ -1,0 +1,4 @@
+import {workspace} from '@/lib/auth';
+import {digest,token} from '@/lib/security';
+import {sql} from '@/lib/db';
+export async function GET(){try{const {user,workspace:w}=await workspace(true);if(!process.env.META_APP_ID||!process.env.APP_URL)return Response.json({error:'Meta configuration missing'},{status:503});const state=token();await sql("INSERT INTO oauth_states VALUES($1,$2,$3,'instagram',now()+interval '10 minutes')",[digest(state),w.id,user.id]);const q=new URLSearchParams({enable_fb_login:'0',force_authentication:'1',client_id:process.env.META_APP_ID,redirect_uri:process.env.APP_URL+'/api/connect/instagram/callback',response_type:'code',scope:'instagram_business_basic,instagram_business_manage_messages,instagram_business_manage_comments',state});return Response.redirect('https://www.instagram.com/oauth/authorize?'+q);}catch{return Response.redirect(new URL('/login',process.env.APP_URL||'https://rddly.vercel.app'));}}

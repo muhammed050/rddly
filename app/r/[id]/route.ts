@@ -1,0 +1,2 @@
+import {sql} from '@/lib/db';
+export async function GET(_:Request,{params}:{params:Promise<{id:string}>}){try{const {id}=await params;if(!/^[a-f0-9-]{36}$/i.test(id))return new Response('Not found',{status:404});const r=(await sql("UPDATE records SET data=jsonb_set(data,'{clicks}',to_jsonb(COALESCE((data->>'clicks')::int,0)+1)) WHERE id=$1 AND kind='links' RETURNING data",[id])).rows[0];if(!r)return new Response('Not found',{status:404});return Response.redirect(r.data.url,302);}catch{return new Response('Link unavailable',{status:503});}}
