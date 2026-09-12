@@ -2,7 +2,7 @@ import {cookies} from 'next/headers';
 import {randomUUID} from 'node:crypto';
 import {sql,transaction} from '@/lib/db';
 import {HttpError,workspace,requireUser,startSession,sameOrigin,rateLimit,admin,audit} from '@/lib/auth';
-import {hashPassword,checkPassword,digest,token} from '@/lib/security';
+import {hashPassword,checkPassword,digest,token,decrypt} from '@/lib/security';
 import {collections,integrationSpecs,type Kind} from '@/lib/catalog';
 import {validateAutomation,validPublicUrl,csvCell,canReply} from '@/lib/engine.mjs';
 import {ai,email,instagram,providerFetch} from '@/lib/providers';
@@ -40,7 +40,29 @@ if(parts[0]==='admin'){await admin();if(method==='GET'){const [users,ws,aff,comm
 const {user,workspace:w}=await workspace();
 const write=()=>{if(!['owner','admin'].includes(w.role))throw new HttpError(403,'تحتاج صلاحية مدير');};
 if(path==='overview'){const [counts,jobs,payments,bookings]=await Promise.all([sql('SELECT kind,count(*)::int AS count FROM records WHERE workspace_id=$1 GROUP BY kind',[w.id]),sql('SELECT status,count(*)::int AS count FROM jobs WHERE workspace_id=$1 GROUP BY status',[w.id]),sql("SELECT currency,sum(amount)::text AS total FROM payments WHERE workspace_id=$1 AND status='paid' GROUP BY currency",[w.id]),sql("SELECT count(*)::int AS count FROM bookings WHERE workspace_id=$1 AND status='confirmed'",[w.id])]);return json({counts:counts.rows,jobs:jobs.rows,payments:payments.rows,bookings:bookings.rows[0].count});}
-if(path==='integrations'){return json({items:integrationSpecs.map(x=>({...x,keys:x.keys.map(key=>({key,configured:!!process.env[key]})),ready:x.status==='implemented'&&x.keys.every(key=>!!process.env[key])})),connections:(await sql('SELECT id,provider,name,external_id,expires_at FROM connections WHERE workspace_id=$1',[w.id])).rows});}
+if(path==='integrations'){
+ const stored=(await sql('SELECT id,provider,name,external_id,expires_at,secret FROM connections WHERE workspace_id=$1',[w.id])).rows;
+ const connections=await Promise.all(stored.map(async c=>{
+  const {secret,...safe}=c;
+  if(c.provider!=='instagram')return safe;
+  const expired=!!c.expires_at&&new Date(c.expires_at).getTime()<=Date.now();
+  if(expired)return {...safe,connectionStatus:'expired',webhookStatus:'unknown'};
+  try{
+   if(!/^v\d+\.\d+$/.test(process.env.META_API_VERSION||''))throw new Error('version');
+   const result=await providerFetch(`https://graph.instagram.com/${process.env.META_API_VERSION}/${encodeURIComponent(c.external_id)}/subscribed_apps`,{headers:{Authorization:`Bearer ${decrypt(secret)}`}});
+   // Only count this app's subscriptions, not subscriptions belonging to other apps.
+   const app=result.data?.find((a:Body)=>String(a.id)===process.env.META_APP_ID);
+   const fields=Array.isArray(app?.subscribed_fields)?app.subscribed_fields:[];
+   return {...safe,connectionStatus:'connected',webhookStatus:fields.includes('comments')&&fields.includes('messages')?'subscribed':'missing'};
+  }catch{return {...safe,connectionStatus:'unverified',webhookStatus:'unknown'};}
+ }));
+ const [comments,jobs,automations]=await Promise.all([
+  sql("SELECT payload->>'text' AS text,created_at FROM events WHERE workspace_id=$1 AND provider='meta' AND id LIKE 'comment:%' ORDER BY created_at DESC LIMIT 1",[w.id]),
+  sql('SELECT status,error,created_at FROM jobs WHERE workspace_id=$1 ORDER BY created_at DESC LIMIT 1',[w.id]),
+  sql("SELECT id,data->>'name' AS name,data->>'keyword' AS keyword,data->>'postId' AS post_id FROM records WHERE workspace_id=$1 AND kind='automations' AND data->>'enabled'='true' ORDER BY created_at LIMIT 20",[w.id])
+ ]);
+ return json({items:integrationSpecs.map(x=>({...x,keys:x.keys.map(key=>({key,configured:!!process.env[key]})),ready:x.status==='implemented'&&x.keys.every(key=>!!process.env[key])})),connections,test:{lastComment:comments.rows[0]||null,lastJob:jobs.rows[0]||null,automations:automations.rows},checkedAt:new Date().toISOString()});
+}
 if(parts[0]==='connections'&&parts[1]&&method==='DELETE'){write();if(!uuid(parts[1]))throw new HttpError(400,'معرف غير صالح');await sql('DELETE FROM connections WHERE id=$1 AND workspace_id=$2',[parts[1],w.id]);await audit(w.id,user.id,'connection.disconnected');return json({ok:true});}
 if(path==='settings'){if(method==='GET')return json(w);write();const b=await body(req);const settings={brandName:str(b,'brandName',100),brandColor:/^#[a-f0-9]{6}$/i.test(b.brandColor||'')?b.brandColor:'#0d9488',timezone:str(b,'timezone',100)||'Asia/Istanbul',tone:str(b,'tone',100),stopWords:str(b,'stopWords',200),aiAuto:false};await sql('UPDATE workspaces SET name=$1,settings=$2 WHERE id=$3',[str(b,'name',100)||w.name,JSON.stringify(settings),w.id]);await audit(w.id,user.id,'settings.updated');return json({ok:true});}
 if(path==='team'){if(method==='GET')return json({items:(await sql('SELECT u.id,u.name,u.email,m.role FROM members m JOIN users u ON u.id=m.user_id WHERE m.workspace_id=$1',[w.id])).rows});write();const b=await body(req);if(method==='POST'){const u=(await sql('SELECT id FROM users WHERE email=$1',[str(b,'email',254).toLowerCase()])).rows[0];if(!u)throw new HttpError(400,'على العضو إنشاء حساب أولًا');if(!['admin','agent','viewer'].includes(b.role))throw new HttpError(400,'صلاحية غير صالحة');if(u.id===w.owner_id)throw new HttpError(400,'لا يمكن تعديل مالك المساحة');await sql('INSERT INTO members VALUES($1,$2,$3) ON CONFLICT(workspace_id,user_id) DO UPDATE SET role=excluded.role',[w.id,u.id,b.role]);await audit(w.id,user.id,'member.added',{email:b.email});return json({ok:true});}if(method==='DELETE'){if(!uuid(str(b,'id'))||b.id===w.owner_id)throw new HttpError(400,'لا يمكن حذف المالك');await sql('DELETE FROM members WHERE workspace_id=$1 AND user_id=$2',[w.id,b.id]);return json({ok:true});}}
